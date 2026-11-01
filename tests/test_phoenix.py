@@ -1,4 +1,4 @@
-"""Characterize the supplied Phoenix code without modifying its behavior."""
+"""Verify Phoenix risk management, ticker freshness and revenge retries offline."""
 import importlib.util
 import json
 from pathlib import Path
@@ -116,19 +116,73 @@ class PhoenixTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(self.bot.positions[S]['amount'],expected,places=7)
         self.assertFalse(self.bot.revenge_ready)
 
-    async def test_blacklist_still_blocks_revenge_detection_and_clears_ready(self):
+    async def test_blacklisted_symbol_allows_revenge_but_not_regular_detection(self):
         self.bot.blacklist[S]=time.time()+60
-        self.bot.revenge_ready=True;self.bot.revenge_symbol=S;self.bot.revenge_side='sell'
+        self.assertIsNone(await self.bot.detect(S))
+        self.assertTrue((await self.bot.detect(S,allow_blacklisted=True))['long'])
+        self.bot.revenge_ready=True;self.bot.revenge_symbol=S;self.bot.revenge_side='buy'
         await self.bot.try_revenge()
-        self.assertFalse(self.bot.positions)
+        self.assertTrue(self.bot.positions[S]['is_revenge'])
         self.assertFalse(self.bot.revenge_ready)
+        self.assertIsNone(self.bot.revenge_symbol)
+        self.assertIsNone(self.bot.revenge_side)
+        saved=json.loads(phoenix.STATE_FILE.read_text())
+        self.assertFalse(saved['revenge_ready'])
+        self.assertTrue(self.bot.is_blacklisted(S))
 
-    async def test_supplied_fresh_ticker_accepts_old_timestamp(self):
-        self.assertEqual(await self.bot.fresh_ticker(S),100)
-        self.assertTrue(await self.bot.enter(S,'buy',1,.1))
-        self.assertEqual(self.bot.positions[S]['entry'],100)
+    async def test_revenge_keeps_ready_for_no_signal_or_wrong_direction(self):
+        self.bot.revenge_ready=True;self.bot.revenge_symbol=S;self.bot.revenge_side='sell'
+        for signal in [None,{'long':True,'short':False}]:
+            with patch.object(self.bot,'detect',AsyncMock(return_value=signal)):
+                await self.bot.try_revenge()
+            self.assertTrue(self.bot.revenge_ready)
+            self.assertEqual(self.bot.revenge_symbol,S)
+            self.assertEqual(self.bot.revenge_side,'sell')
+            self.assertFalse(self.bot.positions)
+
+    async def test_failed_revenge_retries_after_cooldown(self):
+        self.bot.revenge_ready=True;self.bot.revenge_symbol=S;self.bot.revenge_side='buy'
+        self.bot.last_trade[S]=time.time()
+        await self.bot.try_revenge()
+        self.assertTrue(self.bot.revenge_ready)
+        self.assertFalse(self.bot.positions)
+        self.bot.last_trade.clear()
+        await self.bot.try_revenge()
+        self.assertFalse(self.bot.revenge_ready)
+        self.assertEqual(self.bot.positions[S]['side'],'buy')
+
+    async def test_ticker_age_boundary_and_missing_timestamp(self):
+        with patch.object(phoenix.time,'time',return_value=1000):
+            for age in [0,12]:
+                ticker={'last':100,'timestamp':(1000-age)*1000}
+                with patch.object(self.data,'fetch_ticker',AsyncMock(return_value=ticker)):
+                    self.assertEqual(await self.bot.fresh_ticker(S),100)
+            with patch.object(self.data,'fetch_ticker',AsyncMock(return_value={'last':100,'timestamp':987999})):
+                with self.assertRaisesRegex(ValueError,'Stale ticker'):
+                    await self.bot.fresh_ticker(S)
+            for ticker in [{'last':100},{'last':100,'timestamp':None},{'last':100,'timestamp':0}]:
+                with patch.object(self.data,'fetch_ticker',AsyncMock(return_value=ticker)):
+                    self.assertEqual(await self.bot.fresh_ticker(S),100)
         self.data.price=0
         with self.assertRaises(ValueError):await self.bot.fresh_ticker(S)
+
+    async def test_stale_ticker_blocks_entry_and_closing_until_retry(self):
+        stale={'last':94,'timestamp':int((time.time()-60)*1000)}
+        with patch.object(self.data,'fetch_ticker',AsyncMock(return_value=stale)):
+            self.assertFalse(await self.bot.enter(S,'buy',100,.1))
+        self.assertFalse(self.bot.account.trades)
+        self.assertTrue(await self.bot.enter(S,'buy',1,.1))
+        self.assertEqual(self.bot.positions[S]['entry'],100)
+        amount=self.bot.positions[S]['amount']
+        with patch.object(self.data,'fetch_ticker',AsyncMock(return_value=stale)):
+            await self.bot.manage_positions()
+            await self.bot.close_partial(S,.5,'SMART_RETREAT')
+            await self.bot.close_full(S,'SL')
+        self.assertEqual(self.bot.positions[S]['amount'],amount)
+        self.assertEqual(len(self.bot.account.trades),1)
+        self.data.price=94
+        await self.bot.manage_positions()
+        self.assertNotIn(S,self.bot.positions)
 
     async def test_shutdown_saves_state_and_closes_exchange(self):
         import asyncio
