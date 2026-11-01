@@ -5,3 +5,6 @@ paper_state_phoenix.json
 *.log
 .env
 paper_state_phoenix.tmp
+
+.runtime/
+.venv-dashboard/
