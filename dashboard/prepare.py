@@ -1,4 +1,4 @@
-"""Preflight accounts without resetting them; only the upstream idle migration is allowed."""
+"""Preflight accounts without resetting them; the approved upstream state migration is used."""
 
 import fcntl
 import importlib.util
@@ -31,14 +31,20 @@ def prepare():
             if name == "final3" and path.exists():
                 sys.path.insert(0, str(SOURCES[name]))
                 try:
+                    migration_path = SOURCES[name] / "migrate_state.py"
+                    if not migration_path.exists():
+                        migration_path = SOURCES[name] / "migrate_idle_state.py"
                     spec = importlib.util.spec_from_file_location(
-                        "idle_migration", SOURCES[name] / "migrate_idle_state.py"
+                        "final3_state_migration", migration_path
                     )
                     migration = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(migration)
                     backup = migration.migrate(path)
                     if backup:
-                        print("Final-3 idle settings migrated with backup:", backup)
+                        print(
+                            "Final-3 compatible state metadata updated with backup:",
+                            backup,
+                        )
                 finally:
                     sys.path.pop(0)
             state = json.loads(path.read_text()) if path.exists() else {}
