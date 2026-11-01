@@ -193,10 +193,16 @@ class FinalPhoenix:
 
     async def fresh_ticker(self, symbol):
         ticker = await self.exchange.fetch_ticker(symbol)
-        # simple age check using local time (Binance last is usually fresh)
         price = float(ticker["last"])
         if price <= 0:
             raise ValueError("Invalid price")
+
+        # محاولة تقدير عمر السعر
+        ts = ticker.get("timestamp")
+        if ts:
+            age = (time.time() * 1000 - ts) / 1000
+            if age > MAX_TICKER_AGE:
+                raise ValueError(f"Stale ticker age={age:.1f}s")
         return price
 
     async def get_top_symbols(self):
@@ -224,8 +230,8 @@ class FinalPhoenix:
         except:
             return 0.0
 
-    async def detect(self, symbol):
-        if self.is_blacklisted(symbol):
+    async def detect(self, symbol, allow_blacklisted=False):
+        if self.is_blacklisted(symbol) and not allow_blacklisted:
             return None
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, "1m", limit=30)
@@ -390,15 +396,19 @@ class FinalPhoenix:
             return
         symbol = self.revenge_symbol
         side = self.revenge_side
-        sig = await self.detect(symbol)
+
+        # نسمح بالاكتشاف حتى لو محظورة
+        sig = await self.detect(symbol, allow_blacklisted=True)
         if sig and ((side == "buy" and sig["long"]) or (side == "sell" and sig["short"])):
-            await self.enter(symbol, side, sig["price"], sig["strength"] * 0.9,
-                             reason="REVENGE", is_revenge=True)
-        # clear after attempt
-        self.revenge_ready = False
-        self.revenge_symbol = None
-        self.revenge_side = None
-        self.save_state()
+            success = await self.enter(symbol, side, sig["price"], sig["strength"] * 0.9,
+                                       reason="REVENGE", is_revenge=True)
+            if success:
+                # نمسح الجاهزية فقط بعد دخول ناجح
+                self.revenge_ready = False
+                self.revenge_symbol = None
+                self.revenge_side = None
+                self.save_state()
+        # إذا ما نجح الدخول، تبقى الجاهزية موجودة للمحاولة الجاية
 
     async def check_survival(self):
         peak = max(self.account.peak_balance, 1.0)
