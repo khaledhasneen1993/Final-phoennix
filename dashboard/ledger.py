@@ -11,6 +11,8 @@ def fill_key(fill):
         k: fill.get(k)
         for k in ("timestamp", "symbol", "side", "amount", "price", "reduceOnly")
     }
+    if fill.get("position_id"):
+        core["position_id"] = fill["position_id"]
     return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
 
 
@@ -62,11 +64,13 @@ def round_trips(fills):
     opened, closed, unmatched = {}, [], []
     for fill in fills:
         symbol = fill["symbol"]
+        position_id = fill.get("position_id") or symbol
         amount, price = float(fill["amount"]), float(fill["price"])
         if not fill.get("reduceOnly"):
-            if symbol not in opened:
-                opened[symbol] = {
+            if position_id not in opened:
+                opened[position_id] = {
                     "symbol": symbol,
+                    "position_id": position_id,
                     "side": fill["side"],
                     "entry_time": fill.get("timestamp"),
                     "fills": [],
@@ -85,7 +89,7 @@ def round_trips(fills):
                     "strength": fill.get("strength"),
                     "margin_pct": fill.get("margin_pct"),
                 }
-            p = opened[symbol]
+            p = opened[position_id]
             old_remaining = p["remaining_amount"]
             p["average_entry"] = (
                 p.get("average_entry", 0) * old_remaining + price * amount
@@ -95,7 +99,7 @@ def round_trips(fills):
             p["cost"] += amount * price
             p["adds"] += bool(fill.get("scale_in") or fill.get("scaleIn"))
         else:
-            p = opened.get(symbol)
+            p = opened.get(position_id)
             if p is None:
                 unmatched.append(fill)
                 continue
@@ -111,7 +115,7 @@ def round_trips(fills):
                 p["partials"] += 1
             else:
                 p["remaining_amount"] = 0.0
-                opened.pop(symbol)
+                opened.pop(position_id)
                 closed.append(p)
         p["fees_usdt"] += float(fill.get("fee_usdt", 0))
         p["net_pnl_usdt"] = p["gross_pnl_usdt"] - p["fees_usdt"]

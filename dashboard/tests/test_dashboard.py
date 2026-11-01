@@ -96,6 +96,38 @@ class LedgerTests(unittest.TestCase):
             db.close()
             self.assertEqual(len(read_archive(path)), 170)
 
+    def test_two_opposite_positions_same_market_stay_independent(self):
+        def fill(pid, side, close=False, price=100, pnl=0):
+            return dict(
+                position_id=pid,
+                symbol="BTC",
+                side=side,
+                amount=1,
+                price=price,
+                fee_usdt=0.05,
+                reduceOnly=close,
+                pnl_usdt=pnl,
+                timestamp="2026-11-01",
+            )
+
+        rows = [
+            fill("parent", "buy"),
+            fill("child", "sell"),
+            fill("parent", "sell", True, 98, -2),
+        ]
+        result = round_trips(rows)
+        opened, closed = result[:2]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0]["position_id"], "child")
+        self.assertEqual(opened[0]["side"], "sell")
+        self.assertEqual(closed[0]["position_id"], "parent")
+        self.assertAlmostEqual(closed[0]["net_pnl_usdt"], -2.1)
+        rows.append(fill("child", "buy", True, 97, 3))
+        opened, closed = round_trips(rows)[:2]
+        self.assertFalse(opened)
+        self.assertEqual(len(closed), 2)
+        self.assertAlmostEqual(sum(p["net_pnl_usdt"] for p in closed), 0.8)
+
 
 class DashboardTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
