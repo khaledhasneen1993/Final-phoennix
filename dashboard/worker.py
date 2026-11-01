@@ -44,7 +44,10 @@ def phoenix_settings(module):
         retreat_stop_distance=0.032,
         partial_fraction=0.5,
         max_price_age=module.MAX_TICKER_AGE,
-        watch_mode="rest_scan",
+        watch_mode="continuous_rest",
+        entry_scan_pause=module.ENTRY_SCAN_PAUSE,
+        scan_concurrency=module.SCAN_CONCURRENCY,
+        universe_refresh=module.SCAN_INTERVAL,
         exit_interval=7,
         size_formula="min(0.15, 0.09 + max(0, strength - 0.11) * 0.8)",
     )
@@ -68,7 +71,11 @@ def snapshot_state(name, bot, settings, status, ticker_health):
             fee_rate=account.fee_rate,
             last_trade=bot.last_trade,
         )
-        state["scan_report"] = bot.dashboard_scan
+        state["scan_report"] = dict(
+            bot.dashboard_scan,
+            next_universe_at=bot.next_universe_at,
+            watch_symbols=list(bot.watch_symbols),
+        )
         state["risk"] = dict(
             peak_balance=account.peak_balance,
             survival_mode=bot.survival_mode,
@@ -289,10 +296,11 @@ def observe_phoenix(bot, module, health):
 
     async def cycle():
         bot.dashboard_scan = dict(
+            mode="continuous_rest",
             phase="scanning",
             started_at=time.time(),
             checked=0,
-            total=0,
+            total=len(bot.watch_symbols),
             successful=0,
             failed=0,
             signals=0,
@@ -312,7 +320,10 @@ def observe_phoenix(bot, module, health):
             raise
         finally:
             bot.dashboard_scan.update(
-                finished_at=time.time(), next_scan_at=time.time() + module.SCAN_INTERVAL
+                finished_at=time.time(),
+                next_scan_at=time.time() + module.ENTRY_SCAN_PAUSE,
+                next_universe_at=bot.next_universe_at,
+                watch_symbols=list(bot.watch_symbols),
             )
 
     bot.scan_cycle = cycle

@@ -24,7 +24,9 @@ TAKE_PROFIT_PCT = 0.018
 TRAIL_DISTANCE = 0.009
 STOP_LOSS_PCT = 0.055
 COOLDOWN_SEC = 10
-SCAN_INTERVAL = 600
+SCAN_INTERVAL = 600  # Refresh the top-symbol list, not the entry scan.
+ENTRY_SCAN_PAUSE = 2.0
+SCAN_CONCURRENCY = 4
 MAX_SYMBOLS = 40
 MAX_POSITIONS = 4
 MIN_QUOTE_VOLUME = 15_000_000
@@ -152,6 +154,9 @@ class FinalPhoenix:
         self.revenge_side = None
         self.survival_mode = False
         self.lock = asyncio.Lock()
+        self.watch_symbols = ()
+        self.next_universe_at = None
+        self._next_universe_refresh = None
         self.load_state()
         self.exchange = ccxt.binanceusdm(
             {"enableRateLimit": True, "options": {"defaultType": "future"}}
@@ -497,19 +502,45 @@ class FinalPhoenix:
             log.info("SURVIVAL MODE OFF")
             self.save_state()
 
+    async def get_watch_symbols(self):
+        # Keep the current universe between refreshes, including an empty result.
+        if (
+            self._next_universe_refresh is None
+            or time.monotonic() >= self._next_universe_refresh
+        ):
+            symbols = await self.get_top_symbols()
+            self.watch_symbols = tuple(dict.fromkeys(symbols))[:MAX_SYMBOLS]
+            self._next_universe_refresh = time.monotonic() + SCAN_INTERVAL
+            self.next_universe_at = time.time() + SCAN_INTERVAL
+            log.info(
+                "Universe refreshed | symbols=%d | next refresh=%ss",
+                len(self.watch_symbols),
+                SCAN_INTERVAL,
+            )
+        return self.watch_symbols
+
     async def scan_cycle(self):
         await self.check_survival()
-        symbols = await self.get_top_symbols()
+        symbols = await self.get_watch_symbols()
         log.info(
-            f"Scan {len(symbols)} | pos={len(self.positions)} | survival={self.survival_mode}"
+            f"Continuous scan {len(symbols)} | pos={len(self.positions)} | survival={self.survival_mode}"
         )
+        semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
 
+        async def check(symbol):
+            async with semaphore:
+                return await self.detect(symbol)
+
+        # Bound parallel public-data requests; CCXT's rate limiter remains enabled.
+        results = await asyncio.gather(
+            *(check(symbol) for symbol in symbols), return_exceptions=True
+        )
         signals = []
-        for sym in symbols:
-            sig = await self.detect(sym)
-            if sig and (sig["long"] or sig["short"]):
+        for sig in results:
+            if isinstance(sig, Exception):
+                log.warning("Symbol scan failed: %s", sig)
+            elif sig and (sig["long"] or sig["short"]):
                 signals.append(sig)
-            await asyncio.sleep(0.11)
 
         signals.sort(key=lambda x: x["strength"], reverse=True)
 
@@ -542,7 +573,9 @@ class FinalPhoenix:
             )
 
     async def run(self):
-        log.info("Final Phoenix v2 started | Fixed Retreat + Revenge + Full State")
+        log.info(
+            "Final Phoenix v2 started | Continuous REST search | Universe refresh 600s | Fixed Retreat + Revenge + Full State"
+        )
         watcher = asyncio.create_task(self.exit_watcher())
         status = asyncio.create_task(self.status_loop())
         try:
@@ -551,7 +584,7 @@ class FinalPhoenix:
                     await self.scan_cycle()
                 except Exception as e:
                     log.error(f"Cycle error: {e}")
-                await asyncio.sleep(SCAN_INTERVAL)
+                await asyncio.sleep(ENTRY_SCAN_PAUSE)
         finally:
             watcher.cancel()
             status.cancel()

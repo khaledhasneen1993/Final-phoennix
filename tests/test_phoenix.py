@@ -400,6 +400,131 @@ class PhoenixTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(S, self.bot.positions)
         self.assertNotIn(S, self.bot.account.positions)
 
+    async def test_watch_list_refreshes_at_600_seconds_not_every_pass(self):
+        top = AsyncMock(side_effect=[[S], ["ETH/USDT:USDT"]])
+        with patch.object(self.bot, "get_top_symbols", top), patch.object(
+            phoenix.time, "monotonic", return_value=100
+        ) as clock:
+            self.assertEqual(await self.bot.get_watch_symbols(), (S,))
+            clock.return_value = 699
+            self.assertEqual(await self.bot.get_watch_symbols(), (S,))
+            self.assertEqual(top.await_count, 1)
+            clock.return_value = 700
+            self.assertEqual(await self.bot.get_watch_symbols(), ("ETH/USDT:USDT",))
+            self.assertEqual(top.await_count, 2)
+
+    async def test_empty_universe_is_cached_until_refresh(self):
+        with patch.object(
+            self.bot, "get_top_symbols", AsyncMock(return_value=[])
+        ) as top:
+            await self.bot.get_watch_symbols()
+            await self.bot.get_watch_symbols()
+            self.assertEqual(top.await_count, 1)
+
+    async def test_new_signal_on_next_pass_enters_without_universe_refresh(self):
+        no_signal = {
+            "symbol": S,
+            "long": False,
+            "short": False,
+            "strength": 0.1,
+            "price": 100,
+        }
+        signal = dict(no_signal, long=True)
+        with patch.object(
+            self.bot, "get_top_symbols", AsyncMock(return_value=[S])
+        ) as top:
+            with patch.object(
+                self.bot, "detect", AsyncMock(side_effect=[no_signal, signal])
+            ) as detect:
+                await self.bot.scan_cycle()
+                self.assertFalse(self.bot.positions)
+                await self.bot.scan_cycle()
+                self.assertIn(S, self.bot.positions)
+                self.assertEqual(top.await_count, 1)
+                self.assertEqual(detect.await_count, 2)
+
+    async def test_all_40_symbols_checked_with_bounded_concurrency_and_live_exit_watcher(
+        self,
+    ):
+        import asyncio
+
+        symbols = [f"SYM{n}/USDT:USDT" for n in range(40)]
+        active = 0
+        peak = 0
+        four_started = asyncio.Event()
+        release = asyncio.Event()
+        exit_checked = asyncio.Event()
+
+        async def detect(symbol):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == phoenix.SCAN_CONCURRENCY:
+                four_started.set()
+            try:
+                await release.wait()
+                return None
+            finally:
+                active -= 1
+
+        async def manage():
+            exit_checked.set()
+
+        with patch.object(
+            self.bot, "get_watch_symbols", AsyncMock(return_value=symbols)
+        ):
+            with patch.object(
+                self.bot, "detect", AsyncMock(side_effect=detect)
+            ) as checks:
+                with patch.object(self.bot, "manage_positions", manage):
+                    scan = asyncio.create_task(self.bot.scan_cycle())
+                    watcher = None
+                    try:
+                        await asyncio.wait_for(four_started.wait(), 1)
+                        watcher = asyncio.create_task(self.bot.exit_watcher())
+                        await asyncio.wait_for(exit_checked.wait(), 1)
+                        self.assertFalse(scan.done())
+                        release.set()
+                        await scan
+                    finally:
+                        release.set()
+                        scan.cancel()
+                        if watcher:
+                            watcher.cancel()
+                        await asyncio.gather(
+                            scan,
+                            *([watcher] if watcher else []),
+                            return_exceptions=True,
+                        )
+                self.assertEqual(checks.await_count, 40)
+                self.assertEqual(peak, phoenix.SCAN_CONCURRENCY)
+
+    async def test_run_repeats_scan_with_two_second_pause_not_600(self):
+        import asyncio
+
+        count = 0
+
+        async def cycle():
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise asyncio.CancelledError()
+
+        async def background():
+            await asyncio.Event().wait()
+
+        with patch.object(self.bot, "scan_cycle", side_effect=cycle):
+            with patch.object(self.bot, "exit_watcher", background), patch.object(
+                self.bot, "status_loop", background
+            ):
+                with patch.object(phoenix.asyncio, "sleep", new=AsyncMock()) as sleep:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.bot.run()
+        sleep.assert_awaited_once_with(phoenix.ENTRY_SCAN_PAUSE)
+        self.assertEqual(count, 2)
+        self.assertEqual(phoenix.ENTRY_SCAN_PAUSE, 2)
+        self.assertEqual(phoenix.SCAN_INTERVAL, 600)
+
 
 if __name__ == "__main__":
     unittest.main()

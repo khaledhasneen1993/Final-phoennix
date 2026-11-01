@@ -124,6 +124,27 @@ class PhoenixAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.dashboard_scan["checks"][SYMBOL]["status"], "error")
         self.assertFalse(self.bot.account.positions)
 
+    async def test_repeated_scan_retains_total_and_separate_refresh_schedule(self):
+        with patch.object(
+            self.market, "fetch_tickers", wraps=self.market.fetch_tickers
+        ) as top:
+            await self.bot.scan_cycle()
+            first_refresh = self.bot.next_universe_at
+            await self.bot.scan_cycle()
+        self.assertEqual(top.await_count, 1)
+        report = self.bot.dashboard_scan
+        self.assertEqual(report["mode"], "continuous_rest")
+        self.assertEqual(report["total"], 1)
+        self.assertEqual(report["checked"], 1)
+        self.assertEqual(report["next_universe_at"], first_refresh)
+        self.assertAlmostEqual(
+            report["next_scan_at"] - report["finished_at"], 2, places=2
+        )
+        self.assertEqual(self.settings["watch_mode"], "continuous_rest")
+        self.assertEqual(self.settings["universe_refresh"], 600)
+        self.assertEqual(self.settings["scan_concurrency"], 4)
+        json.dumps(report, allow_nan=False)
+
 
 if __name__ == "__main__":
     unittest.main()
