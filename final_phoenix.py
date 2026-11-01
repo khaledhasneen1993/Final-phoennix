@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ MAX_TICKER_AGE = 12.0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("PHOENIX")
 
+
 # ====================== PAPER ACCOUNT ======================
 class PaperAccount:
     def __init__(self):
@@ -67,23 +69,25 @@ class PaperAccount:
             pnl += (price - p["entry"]) * p["amount"] * direction
         return self.balance + pnl
 
-    def amount_to_precision(self, symbol, amount):
-        return round(amount, 4)
-
     async def create_order(self, symbol, side, amount, reduce_only=False, reason=""):
         price = self.prices.get(symbol)
-        if not price or price <= 0:
+        if price is None or not math.isfinite(price) or price <= 0:
             raise ValueError("No valid price")
         amount = float(amount)
-        notional = amount * price
-        fee = notional * self.fee_rate
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("Invalid amount")
+        if side not in ("buy", "sell"):
+            raise ValueError("Invalid side")
 
         if reduce_only:
             pos = self.positions.get(symbol)
             if not pos:
                 raise ValueError("No position")
+            if side == pos["side"]:
+                raise ValueError("Closing side must oppose position")
             direction = 1 if pos["side"] == "buy" else -1
             close_amount = min(amount, pos["amount"])
+            fee = close_amount * price * self.fee_rate
             pnl = (price - pos["entry"]) * close_amount * direction
             self.balance += pnl - fee
             pos["amount"] -= close_amount
@@ -93,37 +97,51 @@ class PaperAccount:
                 pos["margin"] = pos["amount"] * pos["entry"] / LEVERAGE
             trade = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "side": side, "amount": close_amount,
-                "price": price, "pnl_usdt": round(pnl, 4), "fee_usdt": round(fee, 4),
-                "reduceOnly": True, "reason": reason
+                "symbol": symbol,
+                "side": side,
+                "amount": close_amount,
+                "price": price,
+                "pnl_usdt": round(pnl, 4),
+                "fee_usdt": round(fee, 4),
+                "reduceOnly": True,
+                "reason": reason,
             }
             self.trades.append(trade)
             return trade
 
+        if symbol in self.positions:
+            raise ValueError("Position already exists")
+        notional = amount * price
+        fee = notional * self.fee_rate
         margin = notional / LEVERAGE
         if margin + fee > self.free:
             raise ValueError("Insufficient margin")
         self.balance -= fee
         self.positions[symbol] = {
-            "side": side, "entry": price, "amount": amount,
-            "margin": margin, "original_entry": price
+            "side": side,
+            "entry": price,
+            "amount": amount,
+            "margin": margin,
+            "original_entry": price,
         }
         trade = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol, "side": side, "amount": amount,
-            "price": price, "pnl_usdt": 0.0, "fee_usdt": round(fee, 4),
-            "reduceOnly": False, "reason": reason
+            "symbol": symbol,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "pnl_usdt": 0.0,
+            "fee_usdt": round(fee, 4),
+            "reduceOnly": False,
+            "reason": reason,
         }
         self.trades.append(trade)
         return trade
 
+
 # ====================== PHOENIX BOT ======================
 class FinalPhoenix:
     def __init__(self):
-        self.exchange = ccxt.binanceusdm({
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"}
-        })
         self.account = PaperAccount()
         self.positions = {}
         self.last_trade = {}
@@ -135,12 +153,15 @@ class FinalPhoenix:
         self.survival_mode = False
         self.lock = asyncio.Lock()
         self.load_state()
+        self.exchange = ccxt.binanceusdm(
+            {"enableRateLimit": True, "options": {"defaultType": "future"}}
+        )
 
     def load_state(self):
         if not STATE_FILE.exists():
             return
         try:
-            data = json.loads(STATE_FILE.read_text())
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             self.account.balance = data.get("balance", 100.0)
             self.account.peak_balance = data.get("peak_balance", self.account.balance)
             self.account.positions = data.get("account_positions", {})
@@ -148,14 +169,20 @@ class FinalPhoenix:
             self.positions = data.get("strategy_positions", {})
             self.last_trade = data.get("last_trade", {})
             self.blacklist = data.get("blacklist", {})
-            self.recent_losses = defaultdict(list, {k: v for k, v in data.get("recent_losses", {}).items()})
+            self.recent_losses = defaultdict(
+                list, {k: v for k, v in data.get("recent_losses", {}).items()}
+            )
             self.revenge_ready = data.get("revenge_ready", False)
             self.revenge_symbol = data.get("revenge_symbol")
             self.revenge_side = data.get("revenge_side")
             self.survival_mode = data.get("survival_mode", False)
-            log.info(f"Phoenix loaded | bal={self.account.balance:.2f} | peak={self.account.peak_balance:.2f}")
+            log.info(
+                f"Phoenix loaded | bal={self.account.balance:.2f} | peak={self.account.peak_balance:.2f}"
+            )
         except Exception as e:
-            log.warning(f"State load failed: {e}")
+            raise RuntimeError(
+                f"Cannot load state {STATE_FILE}; original file preserved"
+            ) from e
 
     def save_state(self):
         self.account.peak_balance = max(self.account.peak_balance, self.account.balance)
@@ -175,10 +202,13 @@ class FinalPhoenix:
             "revenge_symbol": self.revenge_symbol,
             "revenge_side": self.revenge_side,
             "survival_mode": self.survival_mode,
-            "updated": datetime.now(timezone.utc).isoformat()
+            "updated": datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
         tmp.replace(STATE_FILE)
 
     def is_blacklisted(self, symbol):
@@ -187,19 +217,25 @@ class FinalPhoenix:
     def update_blacklist(self, symbol, lost):
         self.recent_losses[symbol].append(lost)
         self.recent_losses[symbol] = self.recent_losses[symbol][-3:]
-        if len(self.recent_losses[symbol]) >= 2 and sum(self.recent_losses[symbol][-2:]) < -10:
+        if (
+            len(self.recent_losses[symbol]) >= 2
+            and sum(self.recent_losses[symbol][-2:]) < -10
+        ):
             self.blacklist[symbol] = time.time() + BLACKLIST_MINUTES * 60
             log.warning(f"BLACKLIST {symbol} for {BLACKLIST_MINUTES} min")
 
     async def fresh_ticker(self, symbol):
         ticker = await self.exchange.fetch_ticker(symbol)
         price = float(ticker["last"])
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise ValueError("Invalid price")
 
         # محاولة تقدير عمر السعر
         ts = ticker.get("timestamp")
         if ts:
+            ts = float(ts)
+            if not math.isfinite(ts):
+                raise ValueError("Invalid ticker timestamp")
             age = (time.time() * 1000 - ts) / 1000
             if age > MAX_TICKER_AGE:
                 raise ValueError(f"Stale ticker age={age:.1f}s")
@@ -227,7 +263,8 @@ class FinalPhoenix:
             bid = sum(x[1] for x in ob["bids"][:20])
             ask = sum(x[1] for x in ob["asks"][:20])
             return (bid - ask) / (bid + ask) if (bid + ask) > 0 else 0.0
-        except:
+        except Exception as e:
+            log.debug("Order book unavailable for %s: %s", symbol, e)
             return 0.0
 
     async def detect(self, symbol, allow_blacklisted=False):
@@ -241,17 +278,26 @@ class FinalPhoenix:
             vol_spike = df["v"].iloc[-1] / vol_avg if vol_avg > 0 else 0
             imb = await self.get_imbalance(symbol)
 
-            long_sig = ret > CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb > 0.35
-            short_sig = ret < -CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb < -0.35
+            long_sig = (
+                ret > CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb > 0.35
+            )
+            short_sig = (
+                ret < -CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb < -0.35
+            )
             strength = abs(ret) * vol_spike * abs(imb)
 
             return {
-                "long": long_sig, "short": short_sig,
-                "ret": ret, "vol_spike": vol_spike, "imb": imb,
-                "strength": strength, "price": float(df["c"].iloc[-1]),
-                "symbol": symbol
+                "long": long_sig,
+                "short": short_sig,
+                "ret": ret,
+                "vol_spike": vol_spike,
+                "imb": imb,
+                "strength": strength,
+                "price": float(df["c"].iloc[-1]),
+                "symbol": symbol,
             }
-        except Exception:
+        except Exception as e:
+            log.debug("Signal detection failed for %s: %s", symbol, e)
             return None
 
     def calc_margin_pct(self, strength, is_revenge=False):
@@ -263,9 +309,13 @@ class FinalPhoenix:
             return min(MAX_MARGIN_PCT, BASE_MARGIN_PCT + (strength - 0.11) * 0.8)
         return BASE_MARGIN_PCT
 
-    async def enter(self, symbol, side, price, strength, reason="CASCADE", is_revenge=False):
+    async def enter(
+        self, symbol, side, price, strength, reason="CASCADE", is_revenge=False
+    ):
         now = time.time()
         if symbol in self.last_trade and now - self.last_trade[symbol] < COOLDOWN_SEC:
+            return False
+        if symbol in self.positions or symbol in self.account.positions:
             return False
         if len(self.positions) >= MAX_POSITIONS:
             return False
@@ -274,16 +324,12 @@ class FinalPhoenix:
 
         try:
             price = await self.fresh_ticker(symbol)
-        except Exception:
-            return False
+            margin_pct = self.calc_margin_pct(strength, is_revenge=is_revenge)
+            amount = (self.account.balance * margin_pct * LEVERAGE) / price
+            amount = float(self.exchange.amount_to_precision(symbol, amount))
+            if not math.isfinite(amount) or amount <= 0:
+                return False
 
-        margin_pct = self.calc_margin_pct(strength, is_revenge=is_revenge)
-        amount = (self.account.balance * margin_pct * LEVERAGE) / price
-        amount = float(self.exchange.amount_to_precision(symbol, amount))
-        if amount <= 0:
-            return False
-
-        try:
             self.account.prices[symbol] = price
             await self.account.create_order(symbol, side, amount, reason=reason)
             self.last_trade[symbol] = now
@@ -291,15 +337,21 @@ class FinalPhoenix:
                 "side": side,
                 "entry": price,
                 "amount": amount,
-                "sl": price * (1 - STOP_LOSS_PCT) if side == "buy" else price * (1 + STOP_LOSS_PCT),
+                "sl": (
+                    price * (1 - STOP_LOSS_PCT)
+                    if side == "buy"
+                    else price * (1 + STOP_LOSS_PCT)
+                ),
                 "best_price": price,
                 "trailing": False,
                 "retreated": False,
                 "strength": strength,
                 "margin_pct": margin_pct,
-                "is_revenge": is_revenge
+                "is_revenge": is_revenge,
             }
-            log.info(f"ENTER {side.upper()} {symbol} | size={amount:.4f} @ {price:.4f} | {reason} | margin={margin_pct*100:.1f}%")
+            log.info(
+                f"ENTER {side.upper()} {symbol} | size={amount:.4f} @ {price:.4f} | {reason} | margin={margin_pct*100:.1f}%"
+            )
             self.save_state()
             return True
         except Exception as e:
@@ -310,21 +362,28 @@ class FinalPhoenix:
         p = self.positions.get(symbol)
         if not p:
             return
+        if not math.isfinite(fraction) or not 0 < fraction <= 1:
+            raise ValueError("Invalid close fraction")
         amount = p["amount"] * fraction
         side = "sell" if p["side"] == "buy" else "buy"
         try:
             price = await self.fresh_ticker(symbol)
             self.account.prices[symbol] = price
-            await self.account.create_order(symbol, side, amount, reduce_only=True, reason=reason)
-            p["amount"] *= (1 - fraction)
-            if p["amount"] < 1e-6:
+            await self.account.create_order(
+                symbol, side, amount, reduce_only=True, reason=reason
+            )
+            remaining = self.account.positions.get(symbol)
+            if remaining is None:
                 del self.positions[symbol]
             else:
-                # بعد الـ Retreat نسحب الوقف لمسافة معقولة (3.2% من المتوسط الحالي)
+                p["amount"] = remaining["amount"]
+                # الوقف على مسافة 3.2% من سعر تنفيذ الانسحاب.
                 direction = 1 if p["side"] == "buy" else -1
                 p["sl"] = price * (1 - 0.032 * direction)
                 p["retreated"] = True
-            log.info(f"RETREAT {reason} {symbol} | closed {fraction*100:.0f}% @ {price:.4f}")
+            log.info(
+                f"RETREAT {reason} {symbol} | closed {fraction*100:.0f}% @ {price:.4f}"
+            )
             self.save_state()
         except Exception as e:
             log.warning(f"Partial close failed {symbol}: {e}")
@@ -338,7 +397,9 @@ class FinalPhoenix:
             if price is None:
                 price = await self.fresh_ticker(symbol)
             self.account.prices[symbol] = price
-            trade = await self.account.create_order(symbol, side, p["amount"], reduce_only=True, reason=reason)
+            trade = await self.account.create_order(
+                symbol, side, p["amount"], reduce_only=True, reason=reason
+            )
             pnl = trade.get("pnl_usdt", 0.0)
 
             if pnl < -REVENGE_MIN_LOSS:
@@ -347,7 +408,9 @@ class FinalPhoenix:
                 # عكس الاتجاه للانتقام
                 self.revenge_side = "sell" if p["side"] == "buy" else "buy"
                 self.update_blacklist(symbol, pnl)
-                log.warning(f"REVENGE ARMED | loss={pnl:.2f} | next side={self.revenge_side}")
+                log.warning(
+                    f"REVENGE ARMED | loss={pnl:.2f} | next side={self.revenge_side}"
+                )
 
             del self.positions[symbol]
             log.info(f"EXIT {reason} {symbol} @ {price:.4f} | pnl={pnl:.2f}")
@@ -366,7 +429,9 @@ class FinalPhoenix:
 
                 # Hard Stop
                 if direction * (price - p["sl"]) <= 0:
-                    await self.close_full(symbol, "SL" if not p["trailing"] else "TRAIL_SL", price)
+                    await self.close_full(
+                        symbol, "SL" if not p["trailing"] else "TRAIL_SL", price
+                    )
                     continue
 
                 # Smart Retreat
@@ -399,9 +464,17 @@ class FinalPhoenix:
 
         # نسمح بالاكتشاف حتى لو محظورة
         sig = await self.detect(symbol, allow_blacklisted=True)
-        if sig and ((side == "buy" and sig["long"]) or (side == "sell" and sig["short"])):
-            success = await self.enter(symbol, side, sig["price"], sig["strength"] * 0.9,
-                                       reason="REVENGE", is_revenge=True)
+        if sig and (
+            (side == "buy" and sig["long"]) or (side == "sell" and sig["short"])
+        ):
+            success = await self.enter(
+                symbol,
+                side,
+                sig["price"],
+                sig["strength"] * 0.9,
+                reason="REVENGE",
+                is_revenge=True,
+            )
             if success:
                 # نمسح الجاهزية فقط بعد دخول ناجح
                 self.revenge_ready = False
@@ -415,7 +488,9 @@ class FinalPhoenix:
         ratio = self.account.balance / peak
         if ratio < SURVIVAL_THRESHOLD and not self.survival_mode:
             self.survival_mode = True
-            log.warning(f"SURVIVAL MODE ON | {self.account.balance:.1f} < {SURVIVAL_THRESHOLD*100:.0f}% of peak")
+            log.warning(
+                f"SURVIVAL MODE ON | {self.account.balance:.1f} < {SURVIVAL_THRESHOLD*100:.0f}% of peak"
+            )
             self.save_state()
         elif ratio > 0.93 and self.survival_mode:
             self.survival_mode = False
@@ -425,7 +500,9 @@ class FinalPhoenix:
     async def scan_cycle(self):
         await self.check_survival()
         symbols = await self.get_top_symbols()
-        log.info(f"Scan {len(symbols)} | pos={len(self.positions)} | survival={self.survival_mode}")
+        log.info(
+            f"Scan {len(symbols)} | pos={len(self.positions)} | survival={self.survival_mode}"
+        )
 
         signals = []
         for sym in symbols:
@@ -459,8 +536,10 @@ class FinalPhoenix:
     async def status_loop(self):
         while True:
             await asyncio.sleep(25)
-            log.info(f"STATUS | bal={self.account.balance:.2f} | eq={self.account.equity:.2f} | "
-                     f"free={self.account.free:.2f} | pos={len(self.positions)} | peak={self.account.peak_balance:.2f}")
+            log.info(
+                f"STATUS | bal={self.account.balance:.2f} | eq={self.account.equity:.2f} | "
+                f"free={self.account.free:.2f} | pos={len(self.positions)} | peak={self.account.peak_balance:.2f}"
+            )
 
     async def run(self):
         log.info("Final Phoenix v2 started | Fixed Retreat + Revenge + Full State")
@@ -476,16 +555,20 @@ class FinalPhoenix:
         finally:
             watcher.cancel()
             status.cancel()
-            self.save_state()
-            await self.exchange.close()
+            await asyncio.gather(watcher, status, return_exceptions=True)
+            try:
+                self.save_state()
+            finally:
+                await self.exchange.close()
+
 
 async def main():
     bot = FinalPhoenix()
-    try:
-        await bot.run()
-    except KeyboardInterrupt:
-        bot.save_state()
-        log.info("Phoenix stopped & saved")
+    await bot.run()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Phoenix stopped")
